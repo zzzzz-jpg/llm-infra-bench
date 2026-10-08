@@ -1,0 +1,212 @@
+# ---------------------------------------------------------------------------
+# vLLM inference Deployment.
+#
+# The three things that most often go wrong here, and what this file does:
+#
+#  1. Liveness probe kills the pod during model load. A 7B checkpoint takes
+#     1-10 min to load (longer from a network PVC), plus CUDA graph capture.
+#     -> a `startupProbe` owns the whole cold-start window; liveness only
+#        starts counting once startup has succeeded.
+#  2. Container OOMKilled while the GPU looks fine. vLLM needs host RAM for
+#     weight staging, CPU swap space and the tokenizer; the default limit is
+#     way below that.
+#     -> explicit memory request/limit + `--swap-space` sized consistently.
+#  3. Requests cut off mid-stream at 60s.
+#     -> the Ingress in 30-ingress.yaml sets SSE-safe timeouts and buffering
+#        off; terminationGracePeriod + preStop let in-flight streams drain.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: PriorityClass
+metadata:
+  name: llm-serving
+value: 1000000
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: "Protect latency-critical inference replicas from batch/preemptible workloads."
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  namespace: llm-inference
+  labels:
+    app.kubernetes.io/name: vllm
+    app.kubernetes.io/component: inference-engine
+    app.kubernetes.io/part-of: llm-inference
+    # used by the ServiceMonitor / Grafana variable selectors
+    model: qwen2.5-7b-instruct
+    variant: fp16
+spec:
+  # Deliberately NOT 1: a rolling update of a GPU workload with maxSurge=1
+  # needs a spare GPU to exist. If your quota is exactly N GPUs, set
+  # maxSurge: 0 and accept downtime, or raise the quota.
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  selector:
+    matchLabels: {app.kubernetes.io/name: vllm}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vllm
+        app.kubernetes.io/component: inference-engine
+        model: qwen2.5-7b-instruct
+        variant: fp16
+      annotations:
+        # vLLM serves /metrics on the same port as the API
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: /metrics
+        # Change-detector for Grafana annotations: bump this when you change
+        # engine args so the dashboard shows a vertical line at the deploy.
+        llm-inference/config-hash: "REPLACE-WITH-sha256sum-of-args.txt"
+    spec:
+      priorityClassName: llm-serving
+      serviceAccountName: vllm
+      terminationGracePeriodSeconds: 120   # long enough to finish a 2k-token stream
+      automountServiceAccountToken: false
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      # One replica per GPU node: two 7B replicas on one 8-GPU box share PCIe
+      # and host memory bandwidth and your benchmark numbers stop being
+      # comparable with the single-replica case.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {app.kubernetes.io/name: vllm}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  # pin to the GPU class you benchmarked on. Mixing A100 and
+                  # L4 replicas behind one Service produces bimodal latency
+                  # that no alert threshold can describe.
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values: ["NVIDIA-A100-SXM4-80GB", "NVIDIA-A100-PCIE-40GB"]
+      initContainers:
+        # Make sure the model cache is writable by the runtime uid. Cheap, and
+        # it turns a confusing CrashLoopBackOff into a working pod.
+        - name: fix-model-perms
+          image: busybox:1.36
+          command: ["sh", "-c", "chown -R 1000:1000 /models 2>/dev/null || true"]
+          volumeMounts: [{name: models, mountPath: /models}]
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 128Mi}
+      containers:
+        - name: vllm
+          # Pin the digest in production. `latest` on a GPU stack means your
+          # capacity plan silently describes a different engine next week.
+          image: vllm/vllm-openai:v0.8.5
+          imagePullPolicy: IfNotPresent
+          # Args come from the ConfigMap so the running configuration is
+          # inspectable and diffable. Comments in args.txt are stripped here.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              ARGS=$(grep -vE '^\s*(#|$)' /config/args.txt | tr '\n' ' ')
+              echo "[entrypoint] resolved args: $ARGS"
+              exec python3 -m vllm.entrypoints.openai.api_server $ARGS
+          ports:
+            - {name: http, containerPort: 8000, protocol: TCP}
+          envFrom:
+            - configMapRef: {name: vllm-env}
+            - secretRef: {name: vllm-runtime-secrets, optional: true}
+          resources:
+            requests:
+              nvidia.com/gpu: 1        # extended resources: request == limit
+              cpu: "4"
+              memory: 32Gi
+              ephemeral-storage: 8Gi
+            limits:
+              nvidia.com/gpu: 1
+              cpu: "8"                 # tokenizer + detokenizer are on the TTFT path
+              memory: 64Gi
+              ephemeral-storage: 16Gi
+          # ---- probes -----------------------------------------------------
+          startupProbe:                # owns the cold start (weight load + graph capture)
+            httpGet: {path: /health, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 120      # 120 x 10s = 20 min budget
+          readinessProbe:              # gates the Service endpoints
+            httpGet: {path: /health, port: http}
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+            successThreshold: 1
+          livenessProbe:               # only kills a genuinely wedged engine
+            httpGet: {path: /health, port: http}
+            periodSeconds: 20
+            timeoutSeconds: 10
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                # Give the endpoints controller time to remove this pod from
+                # the Service/Ingress backends BEFORE the engine stops
+                # accepting. Without this you get a burst of 502s on every
+                # rollout and every scale-down.
+                command: ["/bin/sh", "-c", "sleep 20"]
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              # IPC_LOCK is needed for CUDA pinned (page-locked) host memory;
+              # without it large prefills fall back to pageable copies and TTFT
+              # regresses. Remove it only if your PSP/PSA forbids it.
+              add: ["IPC_LOCK"]
+            seccompProfile: {type: RuntimeDefault}
+          volumeMounts:
+            - {name: models, mountPath: /models}
+            - {name: engine-args, mountPath: /config, readOnly: true}
+            # NCCL uses /dev/shm for intra-node comms; the 64Mi default is far
+            # too small and fails with "Bus error" at tensor-parallel > 1.
+            - {name: dshm, mountPath: /dev/shm}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: engine-args
+          configMap: {name: vllm-engine-args, items: [{key: args.txt, path: args.txt}]}
+        - name: models
+          persistentVolumeClaim: {claimName: model-cache}
+        - name: dshm
+          emptyDir: {medium: Memory, sizeLimit: 16Gi}
+        - name: tmp
+          emptyDir: {sizeLimit: 8Gi}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vllm
+  namespace: llm-inference
+  labels: {app.kubernetes.io/name: vllm}
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-cache
+  namespace: llm-inference
+  labels: {app.kubernetes.io/name: vllm}
+spec:
+  accessModes: [ReadWriteMany]     # ReadWriteMany so N replicas share one copy.
+                                   # If your storage only offers RWO, use one PVC
+                                   # per replica or preload to node-local NVMe:
+                                   # a network PVC read at 200MB/s adds ~1 min per
+                                   # 15GB of weights to every cold start, which
+                                   # directly degrades your HPA reaction time.
+  resources: {requests: {storage: 200Gi}}
+  # storageClassName: nfs-client / efs-sc / filestore / longhorn

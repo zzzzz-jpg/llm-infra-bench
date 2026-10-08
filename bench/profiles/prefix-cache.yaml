@@ -1,0 +1,47 @@
+# PREFIX-CACHE A/B — closed-loop at LOW concurrency.
+#
+# Prefix caching saves *prefill* work, i.e. tens of milliseconds of TTFT.
+# Run this at saturation and the queueing component of TTFT (seconds) swamps
+# the effect: we measured a <2% difference saturated vs -51% unsaturated on the
+# same workload. See docs/04-experiments.md §2.3.
+#
+# Run each variant twice (prefix 0 and prefix N) and on both engines
+# (cache ON / cache OFF) -> a 2x2 design with a negative control:
+#
+#   for P in 0 512; do
+#     python3 loadgen.py --profile profiles/prefix-cache.yaml \
+#       --shared-prefix-tokens $P --tag pc-on-prefix$P
+#   done
+loadgen:
+  base_url: "http://127.0.0.1:8000"
+  endpoint: "chat"
+
+  # the fixed workload
+  input_len: 1024
+  output_len: 256
+  force_output_len: true
+  num_requests: 200
+  seed: 1234
+
+  # deliberately unsaturated: concurrency well below the knee
+  mode: "closed"
+  max_concurrency: 4
+  warmup_requests: 16      # more warmup than usual: the cache must be populated
+                           # before measurement starts, or the first N requests
+                           # are all misses and the hit ratio is biased low
+  rampup_sec: 0
+
+  # the independent variable
+  prompt_style: "shared_prefix"
+  shared_prefix_tokens: 512      # <-- 0 for the control arm
+  tokenizer: ""                  # set this for exact token counts
+  chars_per_token: 3.6
+
+  scrape_interval: 1.0
+  metrics_endpoints: ["http://127.0.0.1:8000/metrics"]
+  gpu_metrics_endpoints: ["http://127.0.0.1:9400/metrics"]
+  record_itl: true
+
+  out_dir: "results"
+  tag: "prefix-cache"
+  notes: "Prefix-cache A/B; unsaturated by design."

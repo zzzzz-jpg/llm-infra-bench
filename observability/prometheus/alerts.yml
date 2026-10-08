@@ -1,0 +1,265 @@
+# ---------------------------------------------------------------------------
+# alerts.yml — the alert set for an LLM inference service.
+#
+# Thresholds below are DEFAULTS. Replace the two numbers that must come from
+# your own benchmark before you page anyone:
+#
+#   1. `slo:ttft_p99:seconds`  <- from bench/results/capacity-*.md  (the knee)
+#   2. `inference:rps_per_replica:knee` <- measured SLO-compliant rps/replica
+#
+# Alerting on values you did not measure is how teams end up with alerts that
+# fire every day and get muted.
+# ---------------------------------------------------------------------------
+groups:
+  # ==========================================================================
+  # 1. Latency SLO — user-visible regressions
+  # ==========================================================================
+  - name: llm-inference-latency
+    rules:
+      - alert: InferenceTTFTP99AboveSLO
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(vllm:time_to_first_token_seconds_bucket[2m])) by (le, model_name)
+          ) > 2.0
+        for: 3m
+        labels: {severity: page, team: ml-platform}
+        annotations:
+          summary: "TTFT p99 {{ $value | humanizeDuration }} > 2s SLO ({{ $labels.model_name }})"
+          description: >-
+            Time-to-first-token p99 breached the SLO for 3 minutes. Usual causes,
+            in order of likelihood: (1) prefill queue backing up because offered
+            rate exceeded the measured knee — check `vllm:num_requests_waiting`;
+            (2) long-prompt traffic mix shifted — check `vllm:prompt_tokens_total`
+            rate; (3) prefix-cache hit rate collapsed after a deploy or a traffic
+            pattern change; (4) GPU contention from a co-located job.
+          runbook: "docs/05-k8s.md#ttft-p99-above-slo"
+
+      - alert: InferenceTPOTP99AboveSLO
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(vllm:time_per_output_token_seconds_bucket[2m])) by (le, model_name)
+          ) > 0.1
+        for: 3m
+        labels: {severity: page, team: ml-platform}
+        annotations:
+          summary: "TPOT p99 {{ $value | humanizeDuration }} > 100ms ({{ $labels.model_name }})"
+          description: >-
+            Inter-token latency is above the streaming SLO: users see text
+            stutter. Decode is memory-bandwidth bound, so this is almost always
+            "too many sequences in one batch" — compare `vllm:num_requests_running`
+            against the max-num-seqs you benchmarked, and check for preemptions.
+
+      - alert: InferenceE2ELatencyP99High
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(vllm:e2e_request_latency_seconds_bucket[5m])) by (le, model_name)
+          ) > 30
+        for: 5m
+        labels: {severity: ticket}
+        annotations:
+          summary: "E2E request latency p99 {{ $value | humanizeDuration }}"
+
+  # ==========================================================================
+  # 2. Saturation — leading indicators, fire BEFORE the SLO breaks
+  # ==========================================================================
+  - name: llm-inference-saturation
+    rules:
+      - alert: InferenceQueueBacklog
+        expr: sum(vllm:num_requests_waiting) by (model_name) > 4
+        for: 2m
+        labels: {severity: page, team: ml-platform}
+        annotations:
+          summary: "{{ $value }} requests waiting in the scheduler queue"
+          description: >-
+            The engine is admitting fewer requests than are arriving. Queue depth
+            is the single best leading indicator for TTFT: every queued request
+            adds roughly one prefill of delay. If the HPA is already at
+            maxReplicas, this is a capacity incident, not a scaling incident.
+
+      - alert: KVCacheNearExhaustion
+        expr: vllm:gpu_cache_usage_perc > 0.92
+        for: 3m
+        labels: {severity: page}
+        annotations:
+          summary: "KV cache {{ $value | humanizePercentage }} full"
+          description: >-
+            At ~100% the scheduler starts preempting and recomputing sequences,
+            which turns into a TPOT cliff and, eventually, 5xx under load. Fixes:
+            lower max-num-seqs / max-model-len, raise gpu-memory-utilization,
+            enable or verify prefix caching, shrink the KV cache dtype to fp8,
+            or add replicas.
+
+      - alert: InferencePreemptionsOccurring
+        expr: rate(vllm:num_preemptions_total[5m]) > 0.05
+        for: 5m
+        labels: {severity: ticket}
+        annotations:
+          summary: "{{ $value | printf \"%.2f\" }} preemptions/s"
+          description: >-
+            Sequences are being evicted from the batch to free KV blocks and will
+            be recomputed later — pure wasted GPU time and a tail-latency source.
+
+      - alert: PrefixCacheHitRateCollapsed
+        expr: |
+          (
+            sum(rate(vllm:prefix_cache_hits_total[10m]))
+            /
+            clamp_min(sum(rate(vllm:prefix_cache_queries_total[10m])), 1)
+          ) < 0.15
+          and
+          sum(rate(vllm:prefix_cache_queries_total[10m])) > 0
+        for: 15m
+        labels: {severity: ticket}
+        annotations:
+          summary: "Prefix-cache hit rate {{ $value | humanizePercentage }}"
+          description: >-
+            If your workload is supposed to share system prompts or few-shot
+            prefixes, a collapse here means either the routing is spreading
+            same-prefix requests across replicas (fix: session/prefix-affinity
+            routing), the cache was evicted by a long-context spike, or prefix
+            caching was turned off by a config drift. Check
+            `vllm:cache_config_info{enable_prefix_caching="True"}`.
+
+      - alert: InferenceReplicasAtScaleCeiling
+        expr: |
+          kube_horizontalpodautoscaler_status_current_replicas{horizontalpodautoscaler=~".*vllm.*"}
+            >=
+          kube_horizontalpodautoscaler_spec_max_replicas{horizontalpodautoscaler=~".*vllm.*"}
+          and sum(vllm:num_requests_waiting) by (model_name) > 1
+        for: 10m
+        labels: {severity: page, team: ml-platform}
+        annotations:
+          summary: "HPA pinned at maxReplicas while the queue grows"
+          description: >-
+            Autoscaling has run out of room. Either raise maxReplicas (and confirm
+            the GPU quota/node pool can actually schedule them) or shed load. This
+            is the alert that should have fired before the last outage.
+
+  # ==========================================================================
+  # 3. Errors and availability
+  # ==========================================================================
+  - name: llm-inference-availability
+    rules:
+      - alert: InferenceErrorRateHigh
+        expr: |
+          (
+            sum(rate(vllm:request_failure_total[5m]))
+            /
+            clamp_min(sum(rate(vllm:request_success_total[5m])) + sum(rate(vllm:request_failure_total[5m])), 1)
+          ) > 0.01
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "Request failure rate {{ $value | humanizePercentage }}"
+          description: >-
+            Distinguish the causes before acting: timeouts at the gateway (raise
+            proxy_read_timeout — long generations get cut off), CUDA OOM in the
+            engine log, 400s from malformed clients, or 429s from a rate limiter.
+            `vllm:request_success_total{finished_reason="abort"}` climbing means
+            clients are disconnecting mid-stream, which is usually a latency
+            problem wearing an error-rate costume.
+
+      - alert: InferenceNoReadyEndpoints
+        expr: |
+          sum(kube_endpoint_address_available{endpoint=~".*vllm.*"}) == 0
+          or absent(up{job="vllm"} == 1)
+        for: 1m
+        labels: {severity: page, team: ml-platform}
+        annotations:
+          summary: "No healthy inference endpoints"
+          description: "Full outage. Check pod status, then the engine log for a crash loop during weight loading."
+
+      - alert: InferencePodCrashLooping
+        expr: rate(kube_pod_container_status_restarts_total{container="vllm"}[15m]) > 0
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "vLLM container restarted {{ $value }} times in 15m"
+          description: >-
+            The usual suspects: OOMKilled because the container memory limit is
+            below what CUDA context + weights + swap space need; a liveness probe
+            that is too aggressive and kills the pod during model load (this is why
+            the manifest uses a startupProbe); or a GPU that fell off the bus.
+
+      - alert: InferenceStartupTooSlow
+        expr: |
+          time() - kube_pod_start_time{pod=~".*vllm.*"} > 900
+          and kube_pod_status_ready{pod=~".*vllm.*"} == 0
+        for: 1m
+        labels: {severity: ticket}
+        annotations:
+          summary: "Pod {{ $labels.pod }} not ready 15m after start"
+          description: >-
+            Cold start is a scaling property, not just a deploy annoyance: if a
+            replica takes 12 minutes to become ready, the HPA cannot react to a
+            2-minute traffic spike. Track this number and use it to justify
+            warm pools / model preloading onto node-local storage.
+
+  # ==========================================================================
+  # 4. Hardware
+  # ==========================================================================
+  - name: llm-inference-hardware
+    rules:
+      - alert: GPUXIDError
+        expr: DCGM_FI_DEV_XID_ERRORS > 0
+        for: 0m
+        labels: {severity: page, team: infra}
+        annotations:
+          summary: "GPU XID {{ $value }} on {{ $labels.gpu }}"
+          description: >-
+            XID errors are hardware/driver faults, not application bugs. XID 79
+            (GPU fallen off the bus) and 74 (NVLink) require draining the node.
+
+      - alert: GPUThermalThrottling
+        expr: DCGM_FI_DEV_GPU_TEMP > 85
+        for: 5m
+        labels: {severity: ticket}
+        annotations:
+          summary: "GPU temp {{ $value }}C — clocks will throttle"
+          description: "Throttling shows up as a TPOT regression with unchanged load. Correlate with DCGM_FI_DEV_SM_CLOCK."
+
+      - alert: GPUMemoryECCErrors
+        expr: increase(DCGM_FI_DEV_ECC_DBE_VOL_TOTAL[10m]) > 0
+        for: 0m
+        labels: {severity: page, team: infra}
+        annotations:
+          summary: "Uncorrectable ECC errors on {{ $labels.gpu }}"
+
+      - alert: GPUPowerCapped
+        expr: DCGM_FI_DEV_POWER_USAGE > 0.95 * DCGM_FI_DEV_POWER_MGMT_LIMIT
+        for: 10m
+        labels: {severity: ticket}
+        annotations:
+          summary: "GPU {{ $labels.gpu }} running at its power cap"
+
+  # ==========================================================================
+  # 5. Benchmark hygiene — protects the validity of your own measurements
+  # ==========================================================================
+  - name: llm-inference-bench
+    rules:
+      - alert: BenchmarkConfigDrift
+        expr: |
+          count(
+            sum by (enable_prefix_caching, block_size)
+            (vllm:cache_config_info)
+          ) > 1
+        for: 10m
+        labels: {severity: ticket}
+        annotations:
+          summary: "Replicas report different cache configs"
+          description: >-
+            Mixed configuration inside one deployment makes every A/B number
+            meaningless. Fail the comparison rather than reporting it.
+
+      - alert: LoadGeneratorStarved
+        expr: |
+          node_load1{instance=~".*loadgen.*"} > 0.9 * count(node_cpu_seconds_total{mode="idle", instance=~".*loadgen.*"})
+        for: 2m
+        labels: {severity: ticket}
+        annotations:
+          summary: "Load generator host is saturated — results are invalid"
+          description: >-
+            If the client cannot keep up, you measure the client, not the server.
+            Symptom in the run data: `client_queue_wait` p99 grows and achieved
+            rps stays below the requested rate at low concurrency. Shard the load
+            generator across hosts/pods before trusting the numbers.

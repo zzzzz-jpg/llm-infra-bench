@@ -1,0 +1,63 @@
+# ---------------------------------------------------------------------------
+# prometheus.yml — scrape config for the inference stack.
+# In-cluster you should prefer the ServiceMonitor CRs in ../../k8s/base;
+# this file is for a bare-metal / docker-compose dev host.
+# ---------------------------------------------------------------------------
+global:
+  scrape_interval: 5s          # 5s is fine for a single replica; use 15s at scale
+  scrape_timeout: 4s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: dev
+    stack: llm-inference
+
+rule_files:
+  - alerts.yml
+  - recording-rules.yml
+
+# alerting:
+#   alertmanagers:
+#     - static_configs: [{targets: ["alertmanager:9093"]}]
+
+scrape_configs:
+  # --- the inference engine itself (vLLM exposes /metrics by default;
+  #     SGLang needs --enable-metrics) -------------------------------------
+  - job_name: vllm
+    static_configs:
+      - targets: ["127.0.0.1:8000"]
+        labels: {engine: vllm, model: qwen2.5-7b-instruct, variant: fp16}
+    metrics_path: /metrics
+    # Drop the high-cardinality per-bucket series you never query. Keep them
+    # if you want histogram_quantile() — that is what the TTFT p99 alert uses.
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: "vllm:.*_created"
+        action: drop
+
+  - job_name: sglang
+    static_configs:
+      - targets: ["127.0.0.1:30000"]
+        labels: {engine: sglang, model: qwen2.5-7b-instruct, variant: fp16}
+    metrics_path: /metrics
+
+  # --- GPU counters. DCGM gives you utilisation, VRAM, SM/tensor/DRAM
+  #     activity, power, temperature and XID errors ------------------------
+  - job_name: dcgm
+    static_configs:
+      - targets: ["127.0.0.1:9400"]
+        labels: {role: gpu-exporter}
+
+  # --- host level: is the load generator itself the bottleneck? -----------
+  - job_name: node
+    static_configs:
+      - targets: ["127.0.0.1:9100"]
+
+  # --- the gateway in front of the engine: real 4xx/5xx and SSE timeouts --
+  - job_name: gateway
+    static_configs:
+      - targets: ["127.0.0.1:8080"]   # nginx / envoy / istio-proxy
+    metrics_path: /metrics
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9090"]

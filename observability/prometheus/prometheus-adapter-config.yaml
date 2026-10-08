@@ -1,0 +1,65 @@
+# ---------------------------------------------------------------------------
+# prometheus-adapter rules that turn engine telemetry into Kubernetes custom
+# metrics the HPA can scale on.
+#
+#   helm install custom-metrics-prometheus-adapter prometheus-community/prometheus-adapter \
+#     -n monitoring --set prometheus.url=http://kube-prometheus-stack-prometheus.monitoring.svc \
+#     -f observability/prometheus/prometheus-adapter-config.yaml
+#
+# Verify:
+#   kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1/namespaces/llm-inference/pods/*/vllm_num_requests_waiting" | jq
+# ---------------------------------------------------------------------------
+rules:
+  # --- pod-level gauges: queue depth, running requests, KV cache ---
+  - seriesQuery: 'vllm:num_requests_waiting{namespace!="",pod!=""}'
+    seriesFilters: []
+    resources:
+      overrides:
+        namespace: {resource: namespace}
+        pod: {resource: pod}
+    name:
+      matches: "^vllm:(.*)"
+      as: "vllm_$1"          # vllm:num_requests_waiting -> vllm_num_requests_waiting
+    metricsQuery: 'max(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'
+
+  - seriesQuery: 'vllm:num_requests_running{namespace!="",pod!=""}'
+    resources:
+      overrides:
+        namespace: {resource: namespace}
+        pod: {resource: pod}
+    name: {matches: "^vllm:(.*)", as: "vllm_$1"}
+    metricsQuery: 'max(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'
+
+  - seriesQuery: 'vllm:gpu_cache_usage_perc{namespace!="",pod!=""}'
+    resources:
+      overrides:
+        namespace: {resource: namespace}
+        pod: {resource: pod}
+    name: {as: "vllm_kv_cache_utilisation"}
+    metricsQuery: 'max(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'
+
+  # --- per-pod request rate: the "75% of the measured knee" scaling signal ---
+  - seriesQuery: 'inference:requests_per_second:by_pod{namespace!="",pod!=""}'
+    resources:
+      overrides:
+        namespace: {resource: namespace}
+        pod: {resource: pod}
+    name: {as: "inference_requests_per_second_pod"}
+    metricsQuery: 'sum(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'
+
+  - seriesQuery: 'inference:output_tokens_per_second:by_pod{namespace!="",pod!=""}'
+    resources:
+      overrides:
+        namespace: {resource: namespace}
+        pod: {resource: pod}
+    name: {as: "inference_output_tokens_per_second_pod"}
+    metricsQuery: 'sum(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'
+
+  # --- SGLang equivalents, so one HPA works for either engine ---
+  - seriesQuery: 'sglang:num_queue_reqs{namespace!="",pod!=""}'
+    resources:
+      overrides:
+        namespace: {resource: namespace}
+        pod: {resource: pod}
+    name: {as: "vllm_num_requests_waiting"}   # same name on purpose
+    metricsQuery: 'max(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'

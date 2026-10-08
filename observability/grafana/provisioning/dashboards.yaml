@@ -1,0 +1,27 @@
+# Grafana provisioning: mount this file plus the dashboards directory into the
+# Grafana container/pod so the dashboard appears without manual import.
+#
+#   docker run -d -p 3000:3000 \
+#     -v $PWD/observability/grafana/provisioning:/etc/grafana/provisioning \
+#     -v $PWD/observability/grafana/dashboards:/var/lib/grafana/dashboards \
+#     grafana/grafana-oss
+#
+# In-cluster (kube-prometheus-stack): put the dashboard JSON in a ConfigMap
+# labelled `grafana_dashboard: "1"` and the sidecar picks it up:
+#   kubectl -n monitoring create configmap llm-inference-dashboard \
+#     --from-file=vllm-inference.json=observability/grafana/dashboards/vllm-inference.json
+#   kubectl -n monitoring label configmap llm-inference-dashboard grafana_dashboard=1
+apiVersion: 1
+
+providers:
+  - name: llm-inference
+    orgId: 1
+    folder: "LLM Inference"
+    folderUid: llm-inference
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

@@ -1,0 +1,45 @@
+# LONG CONTEXT — where the KV cache, not the SM, becomes the wall.
+#
+# Prefill compute is O(prompt_len) and cannot be amortised by batching, so
+# long-context traffic has a completely different bottleneck profile from
+# chat traffic. Run this before you raise --max-model-len in production:
+#
+#   python3 ../bench/capacity_model.py --preset Qwen2.5-7B --kv-gb 40 --context 32768
+#   #  -> ~22 concurrent sequences at 32k. That is your real ceiling.
+#
+# Requires: --max-model-len >= 34816 on the engine, and enough VRAM.
+loadgen:
+  base_url: "http://127.0.0.1:8000"
+  endpoint: "chat"
+
+  input_len: 32768
+  output_len: 256
+  force_output_len: true
+  num_requests: 32               # long requests are expensive; 32 is enough for
+                                 # p95, not for p99. Raise for a real study.
+  seed: 1234
+
+  mode: "closed"
+  max_concurrency: 4             # start LOW. At 32k context, concurrency 16
+                                 # may exceed the KV budget and cause
+                                 # preemptions or outright refusal.
+  warmup_requests: 2
+  rampup_sec: 0
+
+  prompt_style: "lorem"
+  tokenizer: ""                  # STRONGLY recommended here: a 32k prompt built
+                                 # by the chars-per-token heuristic can be off by
+                                 # +-20%, i.e. +-6.5k tokens, which changes the
+                                 # KV requirement by gigabytes.
+  chars_per_token: 3.6
+
+  scrape_interval: 1.0
+  metrics_endpoints: ["http://127.0.0.1:8000/metrics"]
+  gpu_metrics_endpoints: ["http://127.0.0.1:9400/metrics"]
+  record_itl: true
+  timeout_sec: 1800              # a 32k prefill can take seconds; the whole
+                                 # request tens of seconds
+
+  out_dir: "results"
+  tag: "longcontext"
+  notes: "32k prompt / 256 completion; KV-bound regime."

@@ -1,0 +1,75 @@
+# ---------------------------------------------------------------------------
+# One-shot model pre-load into the shared PVC.
+#
+# Why: if every replica pulls weights from the Hub at startup you get (a) an
+# egress dependency in the serving path, (b) N parallel downloads of the same
+# 15GB, and (c) a cold start measured in tens of minutes, which makes the HPA
+# useless for spikes. Preloading turns cold start into "read from storage".
+#
+#   kubectl apply -f k8s/base/21-model-loader-job.yaml
+#   kubectl -n llm-inference logs -f job/model-loader
+# ---------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: model-loader
+  namespace: llm-inference
+  labels: {app.kubernetes.io/component: model-loader}
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels: {app.kubernetes.io/component: model-loader}
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: downloader
+          image: python:3.11-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              pip install --no-cache-dir -q "huggingface_hub[cli]==0.25.2"
+              echo "[loader] downloading $MODEL_ID -> /models/$MODEL_DIR"
+              hf download "$MODEL_ID" \
+                --local-dir "/models/$MODEL_DIR" \
+                --local-dir-use-symlinks False \
+                --max-workers 8
+              echo "[loader] files:"; du -sh "/models/$MODEL_DIR"; ls -la "/models/$MODEL_DIR"
+              echo "[loader] done at $(date -Is)"
+          env:
+            - name: MODEL_ID
+              value: "Qwen/Qwen2.5-7B-Instruct"
+            - name: MODEL_DIR
+              value: "Qwen2.5-7B-Instruct"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef: {name: hf-credentials, key: token, optional: true}
+            # mirrors: set HF_ENDPOINT=https://hf-mirror.com for CN regions
+            - name: HF_ENDPOINT
+              value: "https://huggingface.co"
+          volumeMounts: [{name: models, mountPath: /models}]
+          resources:
+            requests: {cpu: "1", memory: 2Gi, ephemeral-storage: 20Gi}
+            limits:   {cpu: "2", memory: 4Gi, ephemeral-storage: 40Gi}
+      volumes:
+        - name: models
+          persistentVolumeClaim: {claimName: model-cache}
+---
+# Secrets are placeholders — never commit real values.
+apiVersion: v1
+kind: Secret
+metadata: {name: hf-credentials, namespace: llm-inference}
+type: Opaque
+stringData:
+  token: "hf_REPLACE_ME"
+---
+apiVersion: v1
+kind: Secret
+metadata: {name: vllm-runtime-secrets, namespace: llm-inference}
+type: Opaque
+stringData:
+  # If you front the service with vLLM's own API-key check
+  # (--api-key $(OPENAI_API_KEY)), set it here.
+  OPENAI_API_KEY: "REPLACE_ME"

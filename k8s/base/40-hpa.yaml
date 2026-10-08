@@ -1,0 +1,99 @@
+# ---------------------------------------------------------------------------
+# HorizontalPodAutoscaler for the inference fleet.
+#
+# CPU utilisation is the wrong signal for LLM serving: a replica can be at 15%
+# CPU and 100% saturated on the GPU. Scale on what the engine itself reports —
+# queue depth and per-replica request rate — with CPU only as a floor.
+#
+# The target values below MUST come from your benchmark:
+#   targetAverageValue for rps  = 0.75 x (SLO-compliant rps per replica)
+#   targetAverageValue for queue = 1 (one waiting request already means the
+#                                    admission ceiling was reached)
+# bench/capacity.py prints both. It also prints minReplicas/maxReplicas.
+#
+# Custom metrics require prometheus-adapter; the rules that publish
+# `vllm_num_requests_waiting` and `inference_requests_per_second_pod` are in
+# observability/prometheus/prometheus-adapter-config.yaml.
+# ---------------------------------------------------------------------------
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: vllm
+  namespace: llm-inference
+  labels: {app.kubernetes.io/name: vllm}
+  annotations:
+    llm-inference/measured-knee-rps: "3.5"       # <- from capacity-plan.md
+    llm-inference/measured-knee-concurrency: "12"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: vllm
+  minReplicas: 2
+  maxReplicas: 8            # must be <= ResourceQuota requests.nvidia.com/gpu,
+                            # otherwise the HPA scales and pods stay Pending
+  behavior:
+    scaleUp:
+      # React fast: TTFT degrades within seconds of the knee, and a new replica
+      # still needs minutes to load weights. Stabilisation window short, step big.
+      stabilizationWindowSeconds: 60
+      policies:
+        - {type: Pods, value: 2, periodSeconds: 60}
+        - {type: Percent, value: 100, periodSeconds: 60}
+      selectPolicy: Max
+    scaleDown:
+      # React slowly: scale-in during a lull costs you a 5-minute cold start
+      # when traffic returns, and each terminated replica drops its KV cache
+      # (and its warm prefix cache) on the floor.
+      stabilizationWindowSeconds: 600
+      policies:
+        - {type: Pods, value: 1, periodSeconds: 120}
+      selectPolicy: Min
+  metrics:
+    # 1. Primary: engine queue depth. Non-zero means you are already past the
+    #    admission ceiling, so this fires before TTFT breaches the SLO.
+    - type: Pods
+      pods:
+        metric: {name: vllm_num_requests_waiting}
+        target: {type: AverageValue, averageValue: "1"}
+    # 2. Load-based: per-replica request rate against 75% of the measured knee.
+    - type: Pods
+      pods:
+        metric: {name: inference_requests_per_second_pod}
+        target: {type: AverageValue, averageValue: "2.6"}
+    # 3. Floor/sanity: keeps the HPA working if the custom-metrics API is down.
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 80}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: vllm
+  namespace: llm-inference
+  labels: {app.kubernetes.io/name: vllm}
+spec:
+  # For N replicas, allow one to be gone. maxUnavailable: 1 on a 2-replica
+  # deployment means 50% of capacity disappears during a node drain — prefer
+  # minAvailable once you are at 3+.
+  minAvailable: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: vllm}
+---
+# Optional: VerticalPodAutoscaler in "Off" (recommendation-only) mode. GPU pods
+# must never be resized live — the process holds a CUDA context — but the
+# recommender tells you whether your 64Gi limit is 4x what you actually use.
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: vllm
+  namespace: llm-inference
+spec:
+  targetRef: {apiVersion: apps/v1, kind: Deployment, name: vllm}
+  updatePolicy: {updateMode: "Off"}
+  resourcePolicy:
+    containerPolicies:
+      - containerName: vllm
+        controlledResources: [cpu, memory]
+        controlledValues: RequestsAndLimits

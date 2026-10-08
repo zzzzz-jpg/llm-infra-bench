@@ -1,0 +1,61 @@
+# PRODUCTION MIX — the *other* half of a complete study.
+#
+# baseline.yaml fixes input and output length so A/B comparisons isolate one
+# variable. That is the right tool for experiments and the WRONG tool for
+# capacity planning: real traffic has a length distribution, and both the mean
+# throughput and the tail latency depend on it heavily.
+#
+# Use this profile to answer "how much traffic can I promise my users", after
+# you have used baseline.yaml to answer "which configuration is better".
+#
+# Note force_output_len: false — the model decides when to stop, so output
+# length follows a real (long-tailed) distribution.
+loadgen:
+  base_url: "http://127.0.0.1:8000"
+  endpoint: "chat"
+
+  # length RANGES, not points. Fill these from your own traffic:
+  #   python3 - <<'PY'
+  #   # from a sample of production requests, tokenised
+  #   import numpy as np
+  #   L = np.array([...])            # prompt tokens
+  #   M = np.array([...])            # completion tokens
+  #   for n, a in (("in", L), ("out", M)):
+  #       print(n, np.percentile(a, [5, 50, 95, 99]).round(0))
+  #   PY
+  # Then set input_len/min_input_len to the p95/p50 and the same for output.
+  # The generator draws uniformly in [min_*  , *_len]; for a true empirical
+  # distribution, replay real prompts with prompt_style: file instead.
+  input_len: 2048
+  min_input_len: 128
+  output_len: 512
+  min_output_len: 32
+  force_output_len: false        # <-- realistic EOS behaviour
+
+  num_requests: 0                # 0 -> drive by duration instead
+  duration_sec: 600              # 10 minutes: long enough to see slow cycles
+                                 # (KV fragmentation, log rotation, GC)
+
+  mode: "open"                   # open-loop: the honest model for offered load
+  arrival_process: "poisson"     # bursty, like real users
+  request_rate: 4.0              # <-- start below the measured knee, sweep up
+  max_concurrency: 256           # safety valve only; should never bind
+  warmup_requests: 16
+  rampup_sec: 60                 # linear ramp 10%->100% of request_rate over
+                                 # 60s, so the run does not start with a spike
+                                 # that the HPA has no chance to react to
+
+  prompt_style: "lorem"
+  shared_prefix_tokens: 256      # a realistic shared system prompt
+  tokenizer: ""
+  chars_per_token: 3.6
+
+  scrape_interval: 1.0
+  metrics_endpoints: ["http://127.0.0.1:8000/metrics"]
+  gpu_metrics_endpoints: ["http://127.0.0.1:9400/metrics"]
+  record_itl: true
+  timeout_sec: 900
+
+  out_dir: "results"
+  tag: "production-mix"
+  notes: "Realistic length mix + Poisson arrivals; for capacity, not for A/B."

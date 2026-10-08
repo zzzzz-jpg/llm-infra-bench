@@ -1,0 +1,21 @@
+# Grafana datasource provisioning. The dashboard JSON references the datasource
+# by the template variable ${DS_PROMETHEUS}, so any name works as long as
+# `isDefault: true` is set on exactly one Prometheus.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    # in-cluster:  http://kube-prometheus-stack-prometheus.monitoring.svc:9090
+    # bare metal:  http://127.0.0.1:9090
+    url: http://prometheus.monitoring.svc:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 15s        # must be >= Prometheus scrape_interval, or
+                               # Grafana will interpolate between samples and
+                               # smooth away the very spikes you care about
+      httpMethod: POST
+      exemplarTraceIdDestinations: []
+    editable: true

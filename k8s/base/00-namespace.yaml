@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: llm-inference
+  labels:
+    name: llm-inference
+    # Pod Security Admission: the engine needs SYS_ADMIN-free but does need
+    # IPC_LOCK for pinned memory and a writable /dev/shm, so `baseline`
+    # (not `restricted`) is the honest choice.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: restricted
+---
+# Node pool the GPU workloads land on. Adjust the label to your cluster:
+#   EKS  -> nvidia.com/gpu.present=true   (GPU Operator) or node.kubernetes.io/instance-type
+#   GKE  -> cloud.google.com/gke-accelerator=nvidia-l4
+#   AKS  -> nvidia.com/gpu.present=true
+#   bare -> your own taint, e.g. nvidia.com/gpu=H100:NoSchedule
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: gpu-quota
+  namespace: llm-inference
+spec:
+  hard:
+    requests.nvidia.com/gpu: "8"      # hard ceiling: HPA cannot scale past this
+    limits.nvidia.com/gpu: "8"
+    requests.cpu: "64"
+    requests.memory: 512Gi
+    pods: "32"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: defaults
+  namespace: llm-inference
+spec:
+  limits:
+    - type: Container
+      default:        {cpu: "2", memory: 4Gi}
+      defaultRequest: {cpu: 500m, memory: 1Gi}

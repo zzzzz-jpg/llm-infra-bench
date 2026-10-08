@@ -1,0 +1,99 @@
+# CI: everything that can be checked without a GPU, on every push.
+#
+# The three jobs mirror the three ways this project can be silently wrong:
+#   lint  -> the manifests do not apply / an overlay patch stopped matching
+#   test  -> the metric semantics drifted (TTFT/TPOT/percentiles/load model)
+#   smoke -> the end-to-end pipeline produces degenerate artefacts
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - run: pip install -r requirements.txt
+      - name: kustomize build + kubeconform (incl. CRDs)
+        run: ./scripts/lint_k8s.sh
+      - name: bash syntax
+        run: for f in scripts/*.sh; do bash -n "$f"; done
+      - name: every YAML parses
+        run: |
+          python3 - <<'PY'
+          import glob, sys, yaml
+          bad = 0
+          for f in glob.glob("**/*.yaml", recursive=True) + glob.glob("**/*.yml", recursive=True):
+              if ".tools" in f or "node_modules" in f:
+                  continue
+              try:
+                  list(yaml.safe_load_all(open(f)))
+              except Exception as e:
+                  print(f"FAIL {f}: {e}"); bad += 1
+          sys.exit(1 if bad else 0)
+          PY
+      - name: Grafana dashboard is valid JSON
+        run: python3 -c "import json,glob; [json.load(open(f)) for f in glob.glob('observability/grafana/dashboards/*.json')]"
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "${{ matrix.python-version }}"}
+      - run: pip install -r requirements.txt
+      - name: harness correctness (23 tests, starts its own mock engine)
+        run: python3 -m pytest tests/ -q --maxfail=3
+
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - run: pip install -r requirements.txt
+      - name: start mock topology
+        run: |
+          ./scripts/dev_up.sh
+          for p in 8000 8001 8002 8003 9400; do
+            curl -sf -m 5 "http://127.0.0.1:$p/metrics" >/dev/null || { echo "port $p not up"; exit 1; }
+          done
+      - name: full experiment matrix (3 A/B variables + 2 sweeps)
+        run: COOLDOWN=1 N_REQ=24 CONCS="4 8 12 16" RATES="2 4" ./scripts/demo_mock_matrix.sh
+      - name: every run passes the validity checks
+        run: python3 tests/verify_run.py bench/results/demo
+      - name: reports were produced and are non-empty
+        run: |
+          for f in bench/results/demo/report-A-quantization.md \
+                   bench/results/demo/report-B-prefixcache.md \
+                   bench/results/demo/report-C-engine.md \
+                   bench/results/demo/capacity-plan.md; do
+            test -s "$f" || { echo "missing/empty: $f"; exit 1; }
+            echo "=== $f ==="; head -20 "$f"
+          done
+      - name: capacity plan contains a knee and a replica count
+        run: |
+          grep -q "Knee" bench/results/demo/capacity-plan.md
+          grep -q "replicas required" bench/results/demo/capacity-plan.md
+      - name: upload artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            bench/results/demo/**/summary.json
+            bench/results/demo/**/*.md
+            bench/results/demo/env.json
+          retention-days: 30
+      - name: stop mock topology
+        if: always()
+        run: ./scripts/dev_down.sh

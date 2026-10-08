@@ -1,0 +1,69 @@
+# ---------------------------------------------------------------------------
+# recording-rules.yml — pre-computed series used by dashboards, alerts AND the
+# autoscaler. Computing `histogram_quantile` per panel per refresh is fine for
+# one replica and painful at twenty; recording rules also give the
+# prometheus-adapter a clean, low-cardinality signal to scale on.
+# ---------------------------------------------------------------------------
+groups:
+  - name: inference:slo
+    interval: 15s
+    rules:
+      - record: inference:ttft_seconds:p99_2m
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(vllm:time_to_first_token_seconds_bucket[2m])) by (le, model_name, pod))
+
+      - record: inference:tpot_seconds:p99_2m
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(vllm:time_per_output_token_seconds_bucket[2m])) by (le, model_name, pod))
+
+      - record: inference:e2e_seconds:p99_5m
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(vllm:e2e_request_latency_seconds_bucket[5m])) by (le, model_name))
+
+      - record: inference:itl_seconds:p99_2m
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(vllm:inter_token_latency_seconds_bucket[2m])) by (le, model_name))
+
+      - record: inference:error_ratio:5m
+        expr: |
+          sum(rate(vllm:request_failure_total[5m])) by (model_name)
+          /
+          clamp_min(
+            sum(rate(vllm:request_success_total[5m])) by (model_name)
+            + sum(rate(vllm:request_failure_total[5m])) by (model_name), 1)
+
+      # ---- the number the capacity plan is built on -----------------------
+      - record: inference:requests_per_second:by_pod
+        expr: sum(rate(vllm:request_success_total[2m])) by (model_name, pod)
+
+      - record: inference:output_tokens_per_second:by_pod
+        expr: sum(rate(vllm:generation_tokens_total[2m])) by (model_name, pod)
+
+      - record: inference:prompt_tokens_per_second:by_pod
+        expr: sum(rate(vllm:prompt_tokens_total[2m])) by (model_name, pod)
+
+      - record: inference:prefix_cache_hit_ratio:10m
+        expr: |
+          sum(rate(vllm:prefix_cache_hits_total[10m])) by (model_name)
+          /
+          clamp_min(sum(rate(vllm:prefix_cache_queries_total[10m])) by (model_name), 1)
+
+      # ---- saturation state, 0..1, cheap to alert and to scale on --------
+      - record: inference:saturation_ratio
+        expr: |
+          clamp_max(
+            sum(vllm:num_requests_running) by (model_name)
+            / clamp_min(sum(vllm:max_num_seqs) by (model_name), 1), 1)
+
+      - record: inference:kv_cache_utilisation
+        expr: max(vllm:gpu_cache_usage_perc) by (model_name, pod)
+
+      # ---- cost ----------------------------------------------------------
+      - record: inference:gpu_seconds_per_million_output_tokens:1h
+        expr: |
+          3600 * count(DCGM_FI_DEV_GPU_UTIL{job="dcgm"} > -1)
+          / clamp_min(sum(inference:output_tokens_per_second:by_pod) * 60, 1e-9)

@@ -1,0 +1,19 @@
+# --- required: the load generator and the analysis tools -------------------
+aiohttp>=3.9,<4
+numpy>=1.24
+PyYAML>=6.0
+
+# --- optional but strongly recommended ------------------------------------
+# Exact prompt token counts instead of a chars/token heuristic. Without it the
+# "input length" you record is an estimate, which weakens every comparison.
+transformers>=4.40
+# Only if you want to tokenise without downloading a model config each run:
+# tokenizers>=0.19
+
+# --- tests / CI ------------------------------------------------------------
+pytest>=8.0
+
+# --- not needed by this repo, listed for the serving host ------------------
+# vllm>=0.8            (installs torch, triton, xformers, flash-attn)
+# sglang[all]>=0.4     (alternative engine)
+# prometheus-client    (only if you write your own exporter glue)

@@ -1,0 +1,75 @@
+# ---------------------------------------------------------------------------
+# Ingress for streaming (SSE) inference traffic.
+#
+# Streaming is where generic ingress defaults break: nginx buffers responses
+# and cuts idle connections at 60s, so a 2000-token generation arrives as one
+# blob at the end — or not at all. Every annotation below exists because the
+# default is wrong for SSE.
+#
+# If you use Gateway API / Istio / ALB instead, the equivalents are:
+#   nginx proxy-buffering off     ->  Istio: no response buffering by default; ALB: disable response buffering is not needed but set idle_timeout
+#   nginx proxy-read-timeout      ->  Gateway API: no direct knob; use a sidecar or the Service's own timeouts; ALB: idle_timeout attribute
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vllm
+  namespace: llm-inference
+  labels: {app.kubernetes.io/name: vllm}
+  annotations:
+    # --- SSE correctness ---
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      # never let the proxy hold tokens back
+      proxy_set_header Connection '';
+      proxy_http_version 1.1;
+      chunked_transfer_encoding off;
+    # --- timeouts: a long generation is a slow response, not a dead backend --
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    # --- body size: long-context prompts are large ---
+    nginx.ingress.kubernetes.io/proxy-body-size: 32m
+    # --- keep the real client IP for per-tenant rate limiting ---
+    nginx.ingress.kubernetes.io/use-regex: "false"
+    # --- rate limiting (429 is a much better failure mode than a KV-cache
+    #     collapse; size this from the measured per-replica knee x replicas) --
+    nginx.ingress.kubernetes.io/limit-rps: "40"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "4"
+    nginx.ingress.kubernetes.io/limit-connections: "256"
+    # --- auth: never expose an unauthenticated GPU ---
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: vllm-api-auth
+    nginx.ingress.kubernetes.io/auth-realm: "llm-inference"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [llm.example.com]
+      secretName: vllm-tls
+  rules:
+    - host: llm.example.com
+      http:
+        paths:
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service: {name: vllm, port: {number: 80}}
+          - path: /health
+            pathType: Exact
+            backend:
+              service: {name: vllm, port: {number: 80}}
+          # Deliberately NOT exposed: /metrics is scraped in-cluster by
+          # Prometheus. Publishing it makes your capacity, queue depth and GPU
+          # inventory public.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vllm-api-auth
+  namespace: llm-inference
+type: Opaque
+stringData:
+  # htpasswd -c auth <user>; replace before applying anything real
+  auth: "benchuser:$apr1$REPLACE$ME"

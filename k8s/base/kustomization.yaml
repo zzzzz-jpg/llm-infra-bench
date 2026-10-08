@@ -1,0 +1,37 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: llm-inference
+
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/part-of: llm-inference
+      app.kubernetes.io/managed-by: kustomize
+
+resources:
+  - 00-namespace.yaml
+  - 10-configmap-engine.yaml
+  - 20-deployment.yaml
+  - 21-model-loader-job.yaml
+  - 30-service.yaml
+  - 31-ingress.yaml
+  - 40-hpa.yaml
+  - 50-servicemonitor.yaml
+  # 60-bench-job.yaml is intentionally NOT in the default build: benchmarks are
+  # run on demand, not applied with the service.
+  #   kubectl apply -k k8s/base && kubectl apply -f k8s/base/60-bench-job.yaml
+
+# The Deployment references a config hash annotation so Grafana can mark
+# deploys. Regenerate it whenever engine args change:
+#   make config-hash
+configMapGenerator: []
+
+images:
+  - name: vllm/vllm-openai
+    newTag: v0.8.5
+
+# Bump the suffix on any engine-args change so pods actually roll:
+# ConfigMap updates do NOT restart pods on their own.
+generatorOptions:
+  disableNameSuffixHash: true

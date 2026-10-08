@@ -1,0 +1,89 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Production overlay. Every value here is a *decision*, and each one is
+# annotated with the measurement that should have produced it. If you cannot
+# point at a benchmark run for a number, it is a guess.
+namespace: llm-inference
+
+resources:
+  - ../../base
+
+labels:
+  - includeSelectors: false
+    pairs:
+      environment: production
+
+images:
+  # Pin by digest in prod. A tag can move; a digest cannot.
+  - name: vllm/vllm-openai
+    digest: sha256:REPLACE_WITH_PINNED_DIGEST
+
+patches:
+  # ---- Deployment: replica floor, resources, probes ------------------------
+  - target: {kind: Deployment, name: vllm}
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 3                    # minReplicas from capacity.py + 1 for drains
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: vllm/vllm-openai:v0.8.5
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 40Gi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 72Gi
+      - op: replace
+        path: /spec/template/spec/topologySpreadConstraints/0/whenUnsatisfiable
+        value: DoNotSchedule        # prod: never co-locate two replicas on a node
+
+  # ---- HPA: ceiling from the quota, targets from the knee ------------------
+  - target: {kind: HorizontalPodAutoscaler, name: vllm}
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 3
+      - op: replace
+        path: /spec/maxReplicas
+        value: 8                    # == ResourceQuota requests.nvidia.com/gpu
+      - op: replace
+        path: /spec/metrics/1/pods/target/averageValue
+        value: "2.6"                # 0.75 x measured knee rps/replica (3.5)
+
+  # ---- PDB: at 3+ replicas, keep 2 -----------------------------------------
+  - target: {kind: PodDisruptionBudget, name: vllm}
+    patch: |-
+      - op: remove
+        path: /spec/minAvailable
+      - op: add
+        path: /spec/maxUnavailable
+        value: 1
+
+  # ---- Ingress: no basic auth in prod, use the platform IdP ----------------
+  - target: {kind: Ingress, name: vllm}
+    patch: |-
+      - op: remove
+        path: /metadata/annotations/nginx.ingress.kubernetes.io~1auth-type
+      - op: remove
+        path: /metadata/annotations/nginx.ingress.kubernetes.io~1auth-secret
+      - op: remove
+        path: /metadata/annotations/nginx.ingress.kubernetes.io~1auth-realm
+      - op: replace
+        path: /metadata/annotations/nginx.ingress.kubernetes.io~1limit-rps
+        value: "60"                 # fleet knee x replicas, measured
+      - op: replace
+        path: /spec/rules/0/host
+        value: llm.prod.example.com
+      - op: replace
+        path: /spec/tls/0/hosts/0
+        value: llm.prod.example.com
+
+  # ---- Drop the one-shot model loader from the prod build ------------------
+  # (weights are baked into the node-local cache by a separate pipeline)
+  - target: {kind: Job, name: model-loader}
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/env/0/value
+        value: "Qwen/Qwen2.5-7B-Instruct"

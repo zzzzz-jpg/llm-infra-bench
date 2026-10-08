@@ -1,0 +1,114 @@
+# ---------------------------------------------------------------------------
+# In-cluster load generator.
+#
+# Benchmarking through the public Ingress measures your ingress too (and its
+# rate limiter will clip you). This Job runs inside the cluster against the
+# headless Service, so you can either measure the fleet (`vllm`) or a single
+# replica (`--target-pod`) — the latter is what makes per-replica capacity
+# numbers trustworthy.
+#
+# It also gets its own CPU/memory requests: a starved load generator reports
+# the client's latency, not the server's, and the `LoadGeneratorStarved` alert
+# exists precisely to catch that.
+#
+#   kubectl apply -f k8s/base/60-bench-job.yaml
+#   kubectl -n llm-inference logs -f job/inference-bench
+#   kubectl -n llm-inference cp <pod>:/results ./bench/results/k8s-run
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: bench-results
+  namespace: llm-inference
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: 20Gi}}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bench-profile
+  namespace: llm-inference
+data:
+  k8s.yaml: |
+    loadgen:
+      endpoint: "chat"
+      input_len: 1024
+      output_len: 256
+      force_output_len: true
+      num_requests: 200
+      seed: 1234
+      mode: "closed"
+      max_concurrency: 12        # <- the measured knee, not the engine default
+      warmup_requests: 8
+      prompt_style: "lorem"
+      tokenizer: ""              # set to the model path for exact token counts
+      chars_per_token: 3.6
+      scrape_interval: 1.0
+      record_itl: true
+      out_dir: "/results"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: inference-bench
+  namespace: llm-inference
+  labels: {app.kubernetes.io/component: benchmark}
+spec:
+  backoffLimit: 0                # a failed benchmark must not silently retry:
+                                 # a partial run looks like a real result
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels: {app.kubernetes.io/component: benchmark}
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: loadgen
+          image: python:3.11-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              pip install --no-cache-dir -q aiohttp numpy pyyaml
+              # the harness is baked into the image in a real setup; here we
+              # fetch it from the mounted repo copy so the Job always runs the
+              # same code the developer tested
+              cd /harness/bench
+              python3 ../scripts/record_env.py --out /results/env.json --probe-url "$BASE_URL" || true
+              python3 loadgen.py --profile /config/k8s.yaml \
+                --base-url "$BASE_URL" \
+                --metrics-endpoint "$BASE_URL/metrics" \
+                --gpu-metrics-endpoint "${DCGM_URL:-http://dcgm-exporter.gpu-monitoring.svc:9400/metrics}" \
+                --tag "${TAG:-k8s-incluster}" \
+                --notes "in-cluster run against $BASE_URL"
+              echo "--- summary ---"
+              cat /results/*/summary.json | head -100
+          env:
+            # fleet-wide, via the Service:
+            - name: BASE_URL
+              value: "http://vllm-headless.llm-inference.svc.cluster.local:8000"
+            # single replica (uncomment and set the pod name for per-pod capacity):
+            # - name: BASE_URL
+            #   value: "http://vllm-7d9f-abcde.llm-inference.svc.cluster.local:8000"
+            - name: DCGM_URL
+              value: "http://dcgm-exporter.gpu-monitoring.svc.cluster.local:9400/metrics"
+            - name: TAG
+              value: "k8s-incluster"
+          volumeMounts:
+            - {name: results, mountPath: /results}
+            - {name: profile, mountPath: /config}
+            - {name: harness, mountPath: /harness}
+          resources:
+            # 2 vCPU is the floor for a 200-request streaming benchmark; below
+            # that the client becomes the bottleneck around 40+ concurrent SSE
+            # connections and every latency number inflates.
+            requests: {cpu: "2", memory: 2Gi}
+            limits:   {cpu: "4", memory: 4Gi}
+      volumes:
+        - {name: results, persistentVolumeClaim: {claimName: bench-results}}
+        - {name: profile, configMap: {name: bench-profile}}
+        # In production, bake the harness into an image instead of mounting a
+        # PVC copy of the repo.
+        - name: harness
+          persistentVolumeClaim: {claimName: bench-harness, optional: true}

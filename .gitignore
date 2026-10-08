@@ -1,0 +1,31 @@
+# tooling caches (downloaded by scripts/lint_k8s.sh)
+.tools/
+.devlogs/
+.dev_pids
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# serving artefacts: engine logs and resolved command lines are large and
+# host-specific. Keep them locally; commit only the ones you cite in a report.
+runs/
+*.log
+
+# benchmark results: commit the demo set (it documents the pipeline),
+# ignore everything else by default and force-add what a report cites.
+bench/results/*
+!bench/results/demo/
+bench/results/demo/*
+!bench/results/demo/report-A-quantization.md
+!bench/results/demo/report-B-prefixcache.md
+!bench/results/demo/report-C-engine.md
+!bench/results/demo/capacity-plan.md
+
+# secrets — never commit
+hf-credentials.yaml
+*-secret.real.yaml
+.env

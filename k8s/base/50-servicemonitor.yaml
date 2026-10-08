@@ -1,0 +1,180 @@
+# ---------------------------------------------------------------------------
+# Scraping, in-cluster. Requires the Prometheus Operator (kube-prometheus-stack).
+# The `llm-inference/config-hash` annotation on the pod is picked up as a label
+# so every series carries the deployed configuration — that is what lets you
+# split a Grafana panel by "before/after the config change" without guessing
+# the deploy time.
+# ---------------------------------------------------------------------------
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: vllm
+  namespace: llm-inference
+  labels:
+    app.kubernetes.io/name: vllm
+    release: kube-prometheus-stack     # <- must match your Prometheus selector
+spec:
+  namespaceSelector: {matchNames: [llm-inference]}
+  selector:
+    matchLabels: {app.kubernetes.io/name: vllm}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s          # 15s is enough; 5s x 20 replicas x histogram
+                             # buckets is how Prometheus runs out of RAM
+      scrapeTimeout: 10s
+      honorLabels: true
+      # Pod-level relabels: keep model/variant/node, drop the useless rest.
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_label_model]
+          targetLabel: model
+        - sourceLabels: [__meta_kubernetes_pod_label_variant]
+          targetLabel: variant
+        - sourceLabels: [__meta_kubernetes_pod_annotation_llm_inference_config_hash]
+          targetLabel: config_hash
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+      metricRelabelings:
+        # vLLM exports a `_created` twin for every counter: pure cardinality tax.
+        - sourceLabels: [__name__]
+          regex: ".*_created"
+          action: drop
+        # Keep the histogram buckets you actually compute quantiles from and
+        # drop the ones you do not. This is the single biggest Prometheus
+        # storage lever for a vLLM fleet.
+        - sourceLabels: [__name__, le]
+          regex: "vllm:time_to_first_token_seconds_bucket;(0\\.001|0\\.005|0\\.01|0\\.02|0\\.04)"
+          action: drop
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: dcgm-exporter
+  namespace: llm-inference
+  labels: {release: kube-prometheus-stack}
+spec:
+  namespaceSelector: {any: true}
+  selector:
+    matchLabels: {app: dcgm-exporter}
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: llm-inference
+  namespace: llm-inference
+  labels:
+    release: kube-prometheus-stack
+    app.kubernetes.io/name: vllm
+spec:
+  # Kept in sync with observability/prometheus/alerts.yml by
+  # `make alerts-sync`; edit the standalone file and regenerate this block.
+  groups:
+    - name: llm-inference.latency
+      rules:
+        - alert: InferenceTTFTP99AboveSLO
+          expr: 'inference:ttft_seconds:p99_2m > 2.0'
+          for: 3m
+          labels: {severity: page, team: ml-platform}
+          annotations:
+            summary: "TTFT p99 {{ $value | humanizeDuration }} on {{ $labels.pod }}"
+            description: "Above the 2s SLO for 3m. Check vllm:num_requests_waiting and prefix-cache hit rate first."
+            runbook_url: "https://git.example.com/llm-infra-bench/-/blob/main/docs/05-k8s.md#ttft-p99-above-slo"
+        - alert: InferenceTPOTP99AboveSLO
+          expr: 'inference:tpot_seconds:p99_2m > 0.1'
+          for: 3m
+          labels: {severity: page, team: ml-platform}
+          annotations:
+            summary: "TPOT p99 {{ $value | humanizeDuration }} on {{ $labels.pod }}"
+    - name: llm-inference.saturation
+      rules:
+        - alert: InferenceQueueBacklog
+          expr: 'sum by (model_name) (vllm:num_requests_waiting) > 4'
+          for: 2m
+          labels: {severity: page, team: ml-platform}
+          annotations:
+            summary: "{{ $value }} requests queued for {{ $labels.model_name }}"
+        - alert: KVCacheNearExhaustion
+          expr: 'vllm:gpu_cache_usage_perc > 0.92'
+          for: 3m
+          labels: {severity: page}
+          annotations:
+            summary: "KV cache {{ $value | humanizePercentage }} full on {{ $labels.pod }}"
+        - alert: InferencePreemptionsOccurring
+          expr: 'rate(vllm:num_preemptions_total[5m]) > 0.05'
+          for: 5m
+          labels: {severity: ticket}
+          annotations:
+            summary: "Preemptions on {{ $labels.pod }} — wasted GPU work"
+        - alert: InferenceReplicasAtScaleCeiling
+          expr: |
+            kube_horizontalpodautoscaler_status_current_replicas{horizontalpodautoscaler="vllm",namespace="llm-inference"}
+              >=
+            kube_horizontalpodautoscaler_spec_max_replicas{horizontalpodautoscaler="vllm",namespace="llm-inference"}
+            and sum(vllm:num_requests_waiting{namespace="llm-inference"}) > 1
+          for: 10m
+          labels: {severity: page, team: ml-platform}
+          annotations:
+            summary: "HPA pinned at maxReplicas while the queue grows"
+    - name: llm-inference.availability
+      rules:
+        - alert: InferenceErrorRateHigh
+          expr: 'inference:error_ratio:5m > 0.01'
+          for: 5m
+          labels: {severity: page}
+          annotations:
+            summary: "Failure ratio {{ $value | humanizePercentage }} for {{ $labels.model_name }}"
+        - alert: InferenceNoReadyEndpoints
+          expr: 'sum(kube_endpoint_address_available{namespace="llm-inference",endpoint="vllm"}) == 0'
+          for: 1m
+          labels: {severity: page, team: ml-platform}
+          annotations:
+            summary: "No healthy vLLM endpoints in llm-inference"
+        - alert: InferencePodCrashLooping
+          expr: 'rate(kube_pod_container_status_restarts_total{namespace="llm-inference",container="vllm"}[15m]) > 0'
+          for: 5m
+          labels: {severity: page}
+          annotations:
+            summary: "{{ $labels.pod }} restarting"
+        - alert: InferenceStartupTooSlow
+          expr: |
+            (time() - kube_pod_start_time{namespace="llm-inference",pod=~"vllm.*"}) > 900
+              and on(pod) kube_pod_status_ready{namespace="llm-inference"} == 0
+          for: 1m
+          labels: {severity: ticket}
+          annotations:
+            summary: "{{ $labels.pod }} not ready 15m after start (cold-start regression)"
+    - name: llm-inference.hardware
+      rules:
+        - alert: GPUXIDError
+          expr: 'DCGM_FI_DEV_XID_ERRORS > 0'
+          for: 0m
+          labels: {severity: page, team: infra}
+          annotations:
+            summary: "XID {{ $value }} on node {{ $labels.node }} gpu {{ $labels.gpu }}"
+        - alert: GPUThermalThrottling
+          expr: 'DCGM_FI_DEV_GPU_TEMP > 85'
+          for: 5m
+          labels: {severity: ticket}
+          annotations:
+            summary: "GPU {{ $labels.gpu }} at {{ $value }}C"
+        - alert: GPUMemoryECCErrors
+          expr: 'increase(DCGM_FI_DEV_ECC_DBE_VOL_TOTAL[10m]) > 0'
+          for: 0m
+          labels: {severity: page, team: infra}
+          annotations:
+            summary: "Uncorrectable ECC on {{ $labels.node }} gpu {{ $labels.gpu }}"
+    - name: llm-inference.bench-hygiene
+      rules:
+        - alert: BenchmarkConfigDrift
+          expr: 'count(sum by (config_hash) (vllm:num_requests_running{namespace="llm-inference"})) > 1'
+          for: 10m
+          labels: {severity: ticket}
+          annotations:
+            summary: "Replicas running with different engine configs — A/B results are invalid"

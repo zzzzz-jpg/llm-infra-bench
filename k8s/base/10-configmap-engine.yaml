@@ -1,0 +1,78 @@
+# ---------------------------------------------------------------------------
+# Engine arguments live in a ConfigMap, not inline in the Deployment, so that
+# (a) a config change is a reviewable diff, (b) the running config is visible
+# with `kubectl get cm -o yaml`, and (c) the benchmark harness can read back
+# exactly what was deployed and refuse to compare runs whose configs differ.
+#
+# These defaults are the *starting point*. Every number here that affects
+# capacity (max-num-seqs, gpu-memory-utilization, max-model-len, quantization)
+# must be replaced with the value your benchmark picked — see
+# bench/results/capacity-plan.md.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vllm-engine-args
+  namespace: llm-inference
+  labels: {app.kubernetes.io/name: vllm, app.kubernetes.io/component: engine}
+data:
+  args.txt: |
+    --served-model-name
+    qwen2.5-7b-instruct
+    --host
+    0.0.0.0
+    --port
+    8000
+    --tensor-parallel-size
+    1
+    --max-model-len
+    8192
+    --gpu-memory-utilization
+    0.90
+    # The admission ceiling. Set this to the concurrency at the measured knee,
+    # NOT the engine default (256): past the knee you buy throughput with a
+    # TPOT cliff, and the HPA cannot see that cliff.
+    --max-num-seqs
+    12
+    --max-num-batched-tokens
+    8192
+    --enable-prefix-caching
+    --enable-chunked-prefill
+    --kv-cache-dtype
+    auto
+    --dtype
+    auto
+    --disable-log-requests
+    # Uncomment for a quantized checkpoint (and change the image/model path):
+    # --quantization
+    # awq
+    # Multi-GPU / multi-node:
+    # --pipeline-parallel-size
+    # 2
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vllm-env
+  namespace: llm-inference
+data:
+  # Keep model weights off the container filesystem
+  HF_HOME: /models
+  TRANSFORMERS_CACHE: /models
+  VLLM_CACHE_ROOT: /models/.vllm-cache
+  # Do not let the engine phone home; also avoids a startup stall when the
+  # cluster has no egress.
+  VLLM_NO_USAGE_STATS: "1"
+  DO_NOT_TRACK: "1"
+  HF_HUB_OFFLINE: "1"          # weights are pre-loaded on the PVC -> no egress
+  CUDA_DEVICE_ORDER: PCI_BUS_ID
+  # Tokenizer/detokenizer work is CPU-bound and sits on the critical path of
+  # TTFT; give the process room and pin it to one NUMA node if you can.
+  OMP_NUM_THREADS: "4"
+  TOKENIZERS_PARALLELISM: "true"
+  # NCCL tuning only matters for tensor parallelism > 1
+  NCCL_DEBUG: WARN
+  NCCL_IB_DISABLE: "0"
+  NCCL_ASYNC_ERROR_HANDLING: "1"
+  # Deterministic scheduling helps compare A/B runs
+  VLLM_LOGGING_LEVEL: INFO
